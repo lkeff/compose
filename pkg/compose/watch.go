@@ -128,6 +128,7 @@ func (s *composeService) watch(ctx context.Context, syncChannel chan bool, proje
 		}
 
 		if len(services) == 0 && service.Build == nil {
+			logrus.Debugf("service %q has no build context, skipping watch", service.Name)
 			continue
 		}
 
@@ -155,7 +156,7 @@ func (s *composeService) watch(ctx context.Context, syncChannel chan bool, proje
 
 		var paths, pathLogs []string
 		for _, trigger := range config.Watch {
-			if checkIfPathAlreadyBindMounted(trigger.Path, service.Volumes) {
+			if trigger.Action != types.WatchActionRebuild && checkIfPathAlreadyBindMounted(trigger.Path, service.Volumes) {
 				logrus.Warnf("path '%s' also declared by a bind mount volume, this path won't be monitored!\n", trigger.Path)
 				continue
 			} else {
@@ -293,7 +294,7 @@ func maybeFileEvent(trigger types.Trigger, hostPath string, ignore watch.PathMat
 			return nil
 		}
 		// always use Unix-style paths for inside the container
-		containerPath = path.Join(trigger.Target, rel)
+		containerPath = path.Join(trigger.Target, filepath.ToSlash(rel))
 	}
 
 	return &fileEvent{
@@ -547,19 +548,24 @@ func (s *composeService) handleWatchBatch(ctx context.Context, project *types.Pr
 
 // writeWatchSyncMessage prints out a message about the sync for the changed paths.
 func writeWatchSyncMessage(log api.LogConsumer, serviceName string, pathMappings []sync.PathMapping) {
-	const maxPathsToShow = 10
-	if len(pathMappings) <= maxPathsToShow || logrus.IsLevelEnabled(logrus.DebugLevel) {
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
 		hostPathsToSync := make([]string, len(pathMappings))
 		for i := range pathMappings {
 			hostPathsToSync[i] = pathMappings[i].HostPath
 		}
-		log.Log(api.WatchLogger, fmt.Sprintf("Syncing %q after changes were detected", serviceName))
+		log.Log(
+			api.WatchLogger,
+			fmt.Sprintf(
+				"Syncing %q after changes were detected: %s",
+				serviceName,
+				strings.Join(hostPathsToSync, ", "),
+			),
+		)
 	} else {
-		hostPathsToSync := make([]string, len(pathMappings))
-		for i := range pathMappings {
-			hostPathsToSync[i] = pathMappings[i].HostPath
-		}
-		log.Log(api.WatchLogger, fmt.Sprintf("Syncing service %q after %d changes were detected", serviceName, len(pathMappings)))
+		log.Log(
+			api.WatchLogger,
+			fmt.Sprintf("Syncing service %q after %d changes were detected", serviceName, len(pathMappings)),
+		)
 	}
 }
 

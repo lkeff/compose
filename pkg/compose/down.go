@@ -33,6 +33,7 @@ import (
 	imageapi "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/errdefs"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -66,10 +67,17 @@ func (s *composeService) down(ctx context.Context, projectName string, options a
 	}
 
 	// Check requested services exists in model
-	options.Services, err = checkSelectedServices(options, project)
+	services, err := checkSelectedServices(options, project)
 	if err != nil {
 		return err
 	}
+
+	if len(options.Services) > 0 && len(services) == 0 {
+		logrus.Infof("Any of the services %v not running in project %q", options.Services, projectName)
+		return nil
+	}
+
+	options.Services = services
 
 	if len(containers) > 0 {
 		resourceToRemove = true
@@ -107,7 +115,7 @@ func (s *composeService) down(ctx context.Context, projectName string, options a
 	}
 
 	if !resourceToRemove && len(ops) == 0 {
-		fmt.Fprintf(s.stderr(), "Warning: No resource found to remove for project %q.\n", projectName)
+		logrus.Warnf("Warning: No resource found to remove for project %q.", projectName)
 	}
 
 	eg, _ := errgroup.WithContext(ctx)
