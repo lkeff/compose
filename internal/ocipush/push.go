@@ -23,9 +23,10 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"time"
 
-	pusherrors "github.com/containerd/containerd/remotes/errors"
+	pusherrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/distribution/reference"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/compose/v2/pkg/api"
@@ -54,6 +55,8 @@ const (
 	// 	> an artifactType field, and tooling to work with artifacts should
 	//	> fallback to the config.mediaType value.
 	ComposeEmptyConfigMediaType = "application/vnd.docker.compose.config.empty.v1+json"
+	// ComposeEnvFileMediaType is the media type for each Env File layer in the image manifest.
+	ComposeEnvFileMediaType = "application/vnd.docker.compose.envfile"
 )
 
 // clientAuthStatusCodes are client (4xx) errors that are authentication
@@ -81,6 +84,18 @@ func DescriptorForComposeFile(path string, content []byte) v1.Descriptor {
 	}
 }
 
+func DescriptorForEnvFile(path string, content []byte) v1.Descriptor {
+	return v1.Descriptor{
+		MediaType: ComposeEnvFileMediaType,
+		Digest:    digest.FromString(string(content)),
+		Size:      int64(len(content)),
+		Annotations: map[string]string{
+			"com.docker.compose.version": api.ComposeVersion,
+			"com.docker.compose.envfile": filepath.Base(path),
+		},
+	}
+}
+
 func PushManifest(
 	ctx context.Context,
 	resolver *imagetools.Resolver,
@@ -88,6 +103,12 @@ func PushManifest(
 	layers []Pushable,
 	ociVersion api.OCIVersion,
 ) error {
+	// Check if we need an extra empty layer for the manifest config
+	if ociVersion == api.OCIVersion1_1 || ociVersion == "" {
+		if err := resolver.Push(ctx, named, v1.DescriptorEmptyJSON, v1.DescriptorEmptyJSON.Data); err != nil {
+			return err
+		}
+	}
 	// prepare to push the manifest by pushing the layers
 	layerDescriptors := make([]v1.Descriptor, len(layers))
 	for i := range layers {
@@ -139,14 +160,7 @@ func isNonAuthClientError(statusCode int) bool {
 		// not a client error
 		return false
 	}
-	for _, v := range clientAuthStatusCodes {
-		if statusCode == v {
-			// client auth error
-			return false
-		}
-	}
-	// any other 4xx client error
-	return true
+	return !slices.Contains(clientAuthStatusCodes, statusCode)
 }
 
 func generateManifest(layers []v1.Descriptor, ociCompat api.OCIVersion) ([]Pushable, error) {

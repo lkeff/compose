@@ -18,12 +18,16 @@ package compose
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -59,7 +63,15 @@ func execCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 			return nil
 		}),
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runExec(ctx, dockerCli, backend, opts)
+			err := runExec(ctx, dockerCli, backend, opts)
+			if err != nil {
+				logrus.Debugf("%v", err)
+				var cliError cli.StatusError
+				if ok := errors.As(err, &cliError); ok {
+					os.Exit(err.(cli.StatusError).StatusCode) //nolint: errorlint
+				}
+			}
+			return err
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -86,7 +98,7 @@ func runExec(ctx context.Context, dockerCli command.Cli, backend api.Service, op
 	if err != nil {
 		return err
 	}
-	projectOptions, err := opts.composeOptions.toProjectOptions()
+	projectOptions, err := opts.composeOptions.toProjectOptions() //nolint:staticcheck
 	if err != nil {
 		return err
 	}
@@ -109,8 +121,8 @@ func runExec(ctx context.Context, dockerCli command.Cli, backend api.Service, op
 
 	exitCode, err := backend.Exec(ctx, projectName, execOpts)
 	if exitCode != 0 {
-		errMsg := ""
-		if err != nil {
+		errMsg := fmt.Sprintf("exit status %d", exitCode)
+		if err != nil && err.Error() != "" {
 			errMsg = err.Error()
 		}
 		return cli.StatusError{StatusCode: exitCode, Status: errMsg}

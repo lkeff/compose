@@ -83,7 +83,6 @@ func TestLocalComposeUp(t *testing.T) {
 	t.Run("check user labels", func(t *testing.T) {
 		res := c.RunDockerCmd(t, "inspect", projectName+"-web-1")
 		res.Assert(t, icmd.Expected{Out: `"my-label": "test"`})
-
 	})
 
 	t.Run("check healthcheck output", func(t *testing.T) {
@@ -236,14 +235,14 @@ func TestCompatibility(t *testing.T) {
 }
 
 func TestConfig(t *testing.T) {
-	const projectName = "compose-e2e-convert"
+	const projectName = "compose-e2e-config"
 	c := NewParallelCLI(t)
 
 	wd, err := os.Getwd()
 	assert.NilError(t, err)
 
 	t.Run("up", func(t *testing.T) {
-		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/simple-build-test/compose.yaml", "-p", projectName, "convert")
+		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/simple-build-test/compose.yaml", "-p", projectName, "config")
 		res.Assert(t, icmd.Expected{Out: fmt.Sprintf(`name: %s
 services:
   nginx:
@@ -254,24 +253,24 @@ services:
       default: null
 networks:
   default:
-    name: compose-e2e-convert_default
+    name: compose-e2e-config_default
 `, projectName, filepath.Join(wd, "fixtures", "simple-build-test", "nginx-build")), ExitCode: 0})
 	})
 }
 
 func TestConfigInterpolate(t *testing.T) {
-	const projectName = "compose-e2e-convert-interpolate"
+	const projectName = "compose-e2e-config-interpolate"
 	c := NewParallelCLI(t)
 
 	wd, err := os.Getwd()
 	assert.NilError(t, err)
 
-	t.Run("convert", func(t *testing.T) {
-		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/simple-build-test/compose-interpolate.yaml", "-p", projectName, "convert", "--no-interpolate")
+	t.Run("config", func(t *testing.T) {
+		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/simple-build-test/compose-interpolate.yaml", "-p", projectName, "config", "--no-interpolate")
 		res.Assert(t, icmd.Expected{Out: fmt.Sprintf(`name: %s
 networks:
   default:
-    name: compose-e2e-convert-interpolate_default
+    name: compose-e2e-config-interpolate_default
 services:
   nginx:
     build:
@@ -320,6 +319,7 @@ func TestRemoveOrphaned(t *testing.T) {
 
 func TestComposeFileSetByDotEnv(t *testing.T) {
 	c := NewCLI(t)
+	defer c.cleanupWithDown(t, "dotenv")
 
 	cmd := c.NewDockerComposeCmd(t, "config")
 	cmd.Dir = filepath.Join(".", "fixtures", "dotenv")
@@ -335,6 +335,7 @@ func TestComposeFileSetByDotEnv(t *testing.T) {
 
 func TestComposeFileSetByProjectDirectory(t *testing.T) {
 	c := NewCLI(t)
+	defer c.cleanupWithDown(t, "dotenv")
 
 	dir := filepath.Join(".", "fixtures", "dotenv", "development")
 	cmd := c.NewDockerComposeCmd(t, "--project-directory", dir, "config")
@@ -347,6 +348,7 @@ func TestComposeFileSetByProjectDirectory(t *testing.T) {
 
 func TestComposeFileSetByEnvFile(t *testing.T) {
 	c := NewCLI(t)
+	defer c.cleanupWithDown(t, "dotenv")
 
 	dotEnv, err := os.CreateTemp(t.TempDir(), ".env")
 	assert.NilError(t, err)
@@ -370,6 +372,7 @@ COMPOSE_PROFILES=test
 
 func TestNestedDotEnv(t *testing.T) {
 	c := NewCLI(t)
+	defer c.cleanupWithDown(t, "nested")
 
 	cmd := c.NewDockerComposeCmd(t, "run", "echo")
 	cmd.Dir = filepath.Join(".", "fixtures", "nested")
@@ -381,20 +384,18 @@ func TestNestedDotEnv(t *testing.T) {
 
 	cmd = c.NewDockerComposeCmd(t, "run", "echo")
 	cmd.Dir = filepath.Join(".", "fixtures", "nested", "sub")
+	defer c.cleanupWithDown(t, "nested")
 	res = icmd.RunCmd(cmd)
 	res.Assert(t, icmd.Expected{
 		ExitCode: 0,
 		Out:      "root sub win=sub",
 	})
-
 }
 
 func TestUnnecessaryResources(t *testing.T) {
 	const projectName = "compose-e2e-unnecessary-resources"
 	c := NewParallelCLI(t)
-	t.Cleanup(func() {
-		c.RunDockerComposeCmd(t, "-p", projectName, "down", "-t=0")
-	})
+	defer c.cleanupWithDown(t, projectName)
 
 	res := c.RunDockerComposeCmdNoCheck(t, "-f", "./fixtures/external/compose.yaml", "-p", projectName, "up", "-d")
 	res.Assert(t, icmd.Expected{

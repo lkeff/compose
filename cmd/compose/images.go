@@ -20,9 +20,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
+	"time"
 
+	"github.com/containerd/platforms"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-units"
@@ -30,7 +33,6 @@ import (
 
 	"github.com/docker/compose/v2/cmd/formatter"
 	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/utils"
 )
 
 type imageOptions struct {
@@ -76,7 +78,7 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 			if i := strings.IndexRune(img.ID, ':'); i >= 0 {
 				id = id[i+1:]
 			}
-			if !utils.StringContains(ids, id) {
+			if !slices.Contains(ids, id) {
 				ids = append(ids, id)
 			}
 		}
@@ -85,14 +87,42 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 		}
 		return nil
 	}
+	if opts.Format == "json" {
 
-	sort.Slice(images, func(i, j int) bool {
-		return images[i].ContainerName < images[j].ContainerName
-	})
+		type img struct {
+			ID            string    `json:"ID"`
+			ContainerName string    `json:"ContainerName"`
+			Repository    string    `json:"Repository"`
+			Tag           string    `json:"Tag"`
+			Platform      string    `json:"Platform"`
+			Size          int64     `json:"Size"`
+			LastTagTime   time.Time `json:"LastTagTime"`
+		}
+		// Convert map to slice
+		var imageList []img
+		for ctr, i := range images {
+			imageList = append(imageList, img{
+				ContainerName: ctr,
+				ID:            i.ID,
+				Repository:    i.Repository,
+				Tag:           i.Tag,
+				Platform:      platforms.Format(i.Platform),
+				Size:          i.Size,
+				LastTagTime:   i.LastTagTime,
+			})
+		}
+		json, err := formatter.ToJSON(imageList, "", "")
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(dockerCli.Out(), json)
+		return err
+	}
 
 	return formatter.Print(images, opts.Format, dockerCli.Out(),
 		func(w io.Writer) {
-			for _, img := range images {
+			for _, container := range slices.Sorted(maps.Keys(images)) {
+				img := images[container]
 				id := stringid.TruncateID(img.ID)
 				size := units.HumanSizeWithPrecision(float64(img.Size), 3)
 				repo := img.Repository
@@ -103,8 +133,10 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 				if tag == "" {
 					tag = "<none>"
 				}
-				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", img.ContainerName, repo, tag, id, size)
+				created := units.HumanDuration(time.Now().UTC().Sub(img.LastTagTime)) + " ago"
+				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					container, repo, tag, platforms.Format(img.Platform), id, size, created)
 			}
 		},
-		"CONTAINER", "REPOSITORY", "TAG", "IMAGE ID", "SIZE")
+		"CONTAINER", "REPOSITORY", "TAG", "PLATFORM", "IMAGE ID", "SIZE", "CREATED")
 }

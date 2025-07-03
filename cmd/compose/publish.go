@@ -18,17 +18,22 @@ package compose
 
 import (
 	"context"
+	"errors"
 
+	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
-	"github.com/spf13/cobra"
-
 	"github.com/docker/compose/v2/pkg/api"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 type publishOptions struct {
 	*ProjectOptions
 	resolveImageDigests bool
 	ociVersion          string
+	withEnvironment     bool
+	assumeYes           bool
 }
 
 func publishCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
@@ -36,27 +41,44 @@ func publishCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Servic
 		ProjectOptions: p,
 	}
 	cmd := &cobra.Command{
-		Use:   "publish [OPTIONS] [REPOSITORY]",
+		Use:   "publish [OPTIONS] REPOSITORY[:TAG]",
 		Short: "Publish compose application",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
 			return runPublish(ctx, dockerCli, backend, opts, args[0])
 		}),
-		Args: cobra.ExactArgs(1),
+		Args: cli.ExactArgs(1),
 	}
 	flags := cmd.Flags()
 	flags.BoolVar(&opts.resolveImageDigests, "resolve-image-digests", false, "Pin image tags to digests")
-	flags.StringVar(&opts.ociVersion, "oci-version", "", "OCI Image/Artifact specification version (automatically determined by default)")
+	flags.StringVar(&opts.ociVersion, "oci-version", "", "OCI image/artifact specification version (automatically determined by default)")
+	flags.BoolVar(&opts.withEnvironment, "with-env", false, "Include environment variables in the published OCI artifact")
+	flags.BoolVarP(&opts.assumeYes, "yes", "y", false, `Assume "yes" as answer to all prompts`)
+	flags.SetNormalizeFunc(func(f *pflag.FlagSet, name string) pflag.NormalizedName {
+		// assumeYes was introduced by mistake as `--y`
+		if name == "y" {
+			logrus.Warn("--y is deprecated, please use --yes instead")
+			name = "yes"
+		}
+		return pflag.NormalizedName(name)
+	})
+
 	return cmd
 }
 
 func runPublish(ctx context.Context, dockerCli command.Cli, backend api.Service, opts publishOptions, repository string) error {
-	project, _, err := opts.ToProject(ctx, dockerCli, nil)
+	project, metrics, err := opts.ToProject(ctx, dockerCli, nil)
 	if err != nil {
 		return err
+	}
+
+	if metrics.CountIncludesLocal > 0 {
+		return errors.New("cannot publish compose file with local includes")
 	}
 
 	return backend.Publish(ctx, project, repository, api.PublishOptions{
 		ResolveImageDigests: opts.resolveImageDigests,
 		OCIVersion:          api.OCIVersion(opts.ociVersion),
+		WithEnvironment:     opts.withEnvironment,
+		AssumeYes:           opts.assumeYes,
 	})
 }

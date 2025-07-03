@@ -20,25 +20,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/platforms"
-	"github.com/docker/compose/v2/internal/tracing"
-	moby "github.com/docker/docker/api/types"
 	containerType "github.com/docker/docker/api/types/container"
+	mmount "github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/versions"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/docker/compose/v2/internal/tracing"
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/progress"
 	"github.com/docker/compose/v2/pkg/utils"
@@ -47,7 +47,7 @@ import (
 const (
 	doubledContainerNameWarning = "WARNING: The %q service is using the custom container name %q. " +
 		"Docker requires each container to have a unique name. " +
-		"Remove the custom name to scale the service.\n"
+		"Remove the custom name to scale the service"
 )
 
 // convergence manages service's container lifecycle.
@@ -56,24 +56,26 @@ const (
 // Cross services dependencies are managed by creating services in expected order and updating `service:xx` reference
 // when a service has converged, so dependent ones can be managed with resolved containers references.
 type convergence struct {
-	service       *composeService
-	observedState map[string]Containers
-	stateMutex    sync.Mutex
+	service    *composeService
+	services   map[string]Containers
+	networks   map[string]string
+	volumes    map[string]string
+	stateMutex sync.Mutex
 }
 
 func (c *convergence) getObservedState(serviceName string) Containers {
 	c.stateMutex.Lock()
 	defer c.stateMutex.Unlock()
-	return c.observedState[serviceName]
+	return c.services[serviceName]
 }
 
 func (c *convergence) setObservedState(serviceName string, containers Containers) {
 	c.stateMutex.Lock()
 	defer c.stateMutex.Unlock()
-	c.observedState[serviceName] = containers
+	c.services[serviceName] = containers
 }
 
-func newConvergence(services []string, state Containers, s *composeService) *convergence {
+func newConvergence(services []string, state Containers, networks map[string]string, volumes map[string]string, s *composeService) *convergence {
 	observedState := map[string]Containers{}
 	for _, s := range services {
 		observedState[s] = Containers{}
@@ -83,8 +85,10 @@ func newConvergence(services []string, state Containers, s *composeService) *con
 		observedState[service] = append(observedState[service], c)
 	}
 	return &convergence{
-		service:       s,
-		observedState: observedState,
+		service:  s,
+		services: observedState,
+		networks: networks,
+		volumes:  volumes,
 	}
 }
 
@@ -97,7 +101,7 @@ func (c *convergence) apply(ctx context.Context, project *types.Project, options
 
 		return tracing.SpanWrapFunc("service/apply", tracing.ServiceOptions(service), func(ctx context.Context) error {
 			strategy := options.RecreateDependencies
-			if utils.StringContains(options.Services, name) {
+			if slices.Contains(options.Services, name) {
 				strategy = options.Recreate
 			}
 			return c.ensureService(ctx, project, service, strategy, options.Inherit, options.Timeout)
@@ -106,6 +110,9 @@ func (c *convergence) apply(ctx context.Context, project *types.Project, options
 }
 
 func (c *convergence) ensureService(ctx context.Context, project *types.Project, service types.ServiceConfig, recreate string, inherit bool, timeout *time.Duration) error { //nolint:gocyclo
+	if service.Provider != nil {
+		return c.service.runPlugin(ctx, project, service, "up")
+	}
 	expected, err := getScale(service)
 	if err != nil {
 		return err
@@ -123,11 +130,11 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 
 	sort.Slice(containers, func(i, j int) bool {
 		// select obsolete containers first, so they get removed as we scale down
-		if obsolete, _ := mustRecreate(service, containers[i], recreate); obsolete {
+		if obsolete, _ := c.mustRecreate(service, containers[i], recreate); obsolete {
 			// i is obsolete, so must be first in the list
 			return true
 		}
-		if obsolete, _ := mustRecreate(service, containers[j], recreate); obsolete {
+		if obsolete, _ := c.mustRecreate(service, containers[j], recreate); obsolete {
 			// j is obsolete, so must be first in the list
 			return false
 		}
@@ -136,25 +143,27 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 		ni, erri := strconv.Atoi(containers[i].Labels[api.ContainerNumberLabel])
 		nj, errj := strconv.Atoi(containers[j].Labels[api.ContainerNumberLabel])
 		if erri == nil && errj == nil {
-			return ni < nj
+			return ni > nj
 		}
 
 		// If we don't get a container number (?) just sort by creation date
 		return containers[i].Created < containers[j].Created
 	})
 
+	slices.Reverse(containers)
 	for i, container := range containers {
 		if i >= expected {
 			// Scale Down
+			// As we sorted containers, obsolete ones and/or highest number will be removed
 			container := container
 			traceOpts := append(tracing.ServiceOptions(service), tracing.ContainerOptions(container)...)
 			eg.Go(tracing.SpanWrapFuncForErrGroup(ctx, "service/scale/down", traceOpts, func(ctx context.Context) error {
-				return c.service.stopAndRemoveContainer(ctx, container, timeout, false)
+				return c.service.stopAndRemoveContainer(ctx, container, &service, timeout, false)
 			}))
 			continue
 		}
 
-		mustRecreate, err := mustRecreate(service, container, recreate)
+		mustRecreate, err := c.mustRecreate(service, container, recreate)
 		if err != nil {
 			return err
 		}
@@ -182,7 +191,6 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 		case ContainerCreated:
 		case ContainerRestarting:
 		case ContainerExited:
-			w.Event(progress.CreatedEvent(name))
 		default:
 			container := container
 			eg.Go(tracing.EventWrapFuncForErrGroup(ctx, "service/start", tracing.ContainerOptions(container), func(ctx context.Context) error {
@@ -197,7 +205,6 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 		// Scale UP
 		number := next + i
 		name := getContainerName(project.Name, service, number)
-		i := i
 		eventOpts := tracing.SpanOptions{trace.WithAttributes(attribute.String("container.name", name))}
 		eg.Go(tracing.EventWrapFuncForErrGroup(ctx, "service/scale/up", eventOpts, func(ctx context.Context) error {
 			opts := createOptions{
@@ -219,20 +226,28 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 }
 
 func (c *convergence) stopDependentContainers(ctx context.Context, project *types.Project, service types.ServiceConfig) error {
-	w := progress.ContextWriter(ctx)
 	// Stop dependent containers, so they will be restarted after service is re-created
-	dependents := project.GetDependentsForService(service)
+	dependents := project.GetDependentsForService(service, func(dependency types.ServiceDependency) bool {
+		return dependency.Restart
+	})
+	if len(dependents) == 0 {
+		return nil
+	}
+	err := c.service.stop(ctx, project.Name, api.StopOptions{
+		Services: dependents,
+		Project:  project,
+	})
+	if err != nil {
+		return err
+	}
+
 	for _, name := range dependents {
-		dependents := c.observedState[name]
-		err := c.service.stopContainers(ctx, w, dependents, nil)
-		if err != nil {
-			return err
-		}
-		for i, dependent := range dependents {
+		dependentStates := c.getObservedState(name)
+		for i, dependent := range dependentStates {
 			dependent.State = ContainerExited
-			dependents[i] = dependent
+			dependentStates[i] = dependent
 		}
-		c.observedState[name] = dependents
+		c.setObservedState(name, dependentStates)
 	}
 	return nil
 }
@@ -312,7 +327,7 @@ func (c *convergence) resolveSharedNamespaces(service *types.ServiceConfig) erro
 	return nil
 }
 
-func mustRecreate(expected types.ServiceConfig, actual moby.Container, policy string) (bool, error) {
+func (c *convergence) mustRecreate(expected types.ServiceConfig, actual containerType.Summary, policy string) (bool, error) {
 	if policy == api.RecreateNever {
 		return false, nil
 	}
@@ -325,7 +340,74 @@ func mustRecreate(expected types.ServiceConfig, actual moby.Container, policy st
 	}
 	configChanged := actual.Labels[api.ConfigHashLabel] != configHash
 	imageUpdated := actual.Labels[api.ImageDigestLabel] != expected.CustomLabels[api.ImageDigestLabel]
-	return configChanged || imageUpdated, nil
+	if configChanged || imageUpdated {
+		return true, nil
+	}
+
+	if c.networks != nil && actual.State == "running" {
+		if checkExpectedNetworks(expected, actual, c.networks) {
+			return true, nil
+		}
+	}
+
+	if c.volumes != nil {
+		if checkExpectedVolumes(expected, actual, c.volumes) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func checkExpectedNetworks(expected types.ServiceConfig, actual containerType.Summary, networks map[string]string) bool {
+	// check the networks container is connected to are the expected ones
+	for net := range expected.Networks {
+		id := networks[net]
+		if id == "swarm" {
+			// corner-case : swarm overlay network isn't visible until a container is attached
+			continue
+		}
+		found := false
+		for _, settings := range actual.NetworkSettings.Networks {
+			if settings.NetworkID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// config is up-to-date but container is not connected to network
+			return true
+		}
+	}
+	return false
+}
+
+func checkExpectedVolumes(expected types.ServiceConfig, actual containerType.Summary, volumes map[string]string) bool {
+	// check container's volume mounts and search for the expected ones
+	for _, vol := range expected.Volumes {
+		if vol.Type != string(mmount.TypeVolume) {
+			continue
+		}
+		if vol.Source == "" {
+			continue
+		}
+		id := volumes[vol.Source]
+		found := false
+		for _, mount := range actual.Mounts {
+			if mount.Type != mmount.TypeVolume {
+				continue
+			}
+			if mount.Name == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// config is up-to-date but container doesn't have volume mounted
+			return true
+		}
+	}
+	return false
 }
 
 func getContainerName(projectName string, service types.ServiceConfig, number int) string {
@@ -340,22 +422,22 @@ func getDefaultContainerName(projectName, serviceName, index string) string {
 	return strings.Join([]string{projectName, serviceName, index}, api.Separator)
 }
 
-func getContainerProgressName(container moby.Container) string {
-	return "Container " + getCanonicalContainerName(container)
+func getContainerProgressName(ctr containerType.Summary) string {
+	return "Container " + getCanonicalContainerName(ctr)
 }
 
 func containerEvents(containers Containers, eventFunc func(string) progress.Event) []progress.Event {
 	events := []progress.Event{}
-	for _, container := range containers {
-		events = append(events, eventFunc(getContainerProgressName(container)))
+	for _, ctr := range containers {
+		events = append(events, eventFunc(getContainerProgressName(ctr)))
 	}
 	return events
 }
 
 func containerReasonEvents(containers Containers, eventFunc func(string, string) progress.Event, reason string) []progress.Event {
 	events := []progress.Event{}
-	for _, container := range containers {
-		events = append(events, eventFunc(getContainerProgressName(container), reason))
+	for _, ctr := range containers {
+		events = append(events, eventFunc(getContainerProgressName(ctr), reason))
 	}
 	return events
 }
@@ -379,7 +461,7 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 			continue
 		}
 
-		waitingFor := containers.filter(isService(dep))
+		waitingFor := containers.filter(isService(dep), isNotOneOff)
 		w.Events(containerEvents(waitingFor, progress.Waiting))
 		if len(waitingFor) == 0 {
 			if config.Required {
@@ -389,7 +471,6 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 			continue
 		}
 
-		dep, config := dep, config
 		eg.Go(func() error {
 			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
@@ -482,11 +563,14 @@ func shouldWaitForDependency(serviceName string, dependencyConfig types.ServiceD
 	} else if service.GetScale() == 0 {
 		// don't wait for the dependency which configured to have 0 containers running
 		return false, nil
+	} else if service.Provider != nil {
+		// don't wait for provider services
+		return false, nil
 	}
 	return true, nil
 }
 
-func nextContainerNumber(containers []moby.Container) int {
+func nextContainerNumber(containers []containerType.Summary) int {
 	maxNumber := 0
 	for _, c := range containers {
 		s, ok := c.Labels[api.ContainerNumberLabel]
@@ -503,16 +587,23 @@ func nextContainerNumber(containers []moby.Container) int {
 		}
 	}
 	return maxNumber + 1
-
 }
 
 func (s *composeService) createContainer(ctx context.Context, project *types.Project, service types.ServiceConfig,
-	name string, number int, opts createOptions) (container moby.Container, err error) {
+	name string, number int, opts createOptions,
+) (ctr containerType.Summary, err error) {
 	w := progress.ContextWriter(ctx)
 	eventName := "Container " + name
 	w.Event(progress.CreatingEvent(eventName))
-	container, err = s.createMobyContainer(ctx, project, service, name, number, nil, opts, w)
+	ctr, err = s.createMobyContainer(ctx, project, service, name, number, nil, opts, w)
 	if err != nil {
+		if ctx.Err() == nil {
+			w.Event(progress.Event{
+				ID:         eventName,
+				Status:     progress.Error,
+				StatusText: err.Error(),
+			})
+		}
 		return
 	}
 	w.Event(progress.CreatedEvent(eventName))
@@ -520,17 +611,27 @@ func (s *composeService) createContainer(ctx context.Context, project *types.Pro
 }
 
 func (s *composeService) recreateContainer(ctx context.Context, project *types.Project, service types.ServiceConfig,
-	replaced moby.Container, inherit bool, timeout *time.Duration) (moby.Container, error) {
-	var created moby.Container
+	replaced containerType.Summary, inherit bool, timeout *time.Duration,
+) (created containerType.Summary, err error) {
 	w := progress.ContextWriter(ctx)
-	w.Event(progress.NewEvent(getContainerProgressName(replaced), progress.Working, "Recreate"))
+	eventName := getContainerProgressName(replaced)
+	w.Event(progress.NewEvent(eventName, progress.Working, "Recreate"))
+	defer func() {
+		if err != nil && ctx.Err() == nil {
+			w.Event(progress.Event{
+				ID:         eventName,
+				Status:     progress.Error,
+				StatusText: err.Error(),
+			})
+		}
+	}()
 
 	number, err := strconv.Atoi(replaced.Labels[api.ContainerNumberLabel])
 	if err != nil {
 		return created, err
 	}
 
-	var inherited *moby.Container
+	var inherited *containerType.Summary
 	if inherit {
 		inherited = &replaced
 	}
@@ -563,18 +664,23 @@ func (s *composeService) recreateContainer(ctx context.Context, project *types.P
 		return created, err
 	}
 
-	w.Event(progress.NewEvent(getContainerProgressName(replaced), progress.Done, "Recreated"))
+	w.Event(progress.NewEvent(eventName, progress.Done, "Recreated"))
 	return created, err
 }
 
-func (s *composeService) startContainer(ctx context.Context, container moby.Container) error {
+// force sequential calls to ContainerStart to prevent race condition in engine assigning ports from ranges
+var startMx sync.Mutex
+
+func (s *composeService) startContainer(ctx context.Context, ctr containerType.Summary) error {
 	w := progress.ContextWriter(ctx)
-	w.Event(progress.NewEvent(getContainerProgressName(container), progress.Working, "Restart"))
-	err := s.apiClient().ContainerStart(ctx, container.ID, containerType.StartOptions{})
+	w.Event(progress.NewEvent(getContainerProgressName(ctr), progress.Working, "Restart"))
+	startMx.Lock()
+	defer startMx.Unlock()
+	err := s.apiClient().ContainerStart(ctx, ctr.ID, containerType.StartOptions{})
 	if err != nil {
 		return err
 	}
-	w.Event(progress.NewEvent(getContainerProgressName(container), progress.Done, "Restarted"))
+	w.Event(progress.NewEvent(getContainerProgressName(ctr), progress.Done, "Restarted"))
 	return nil
 }
 
@@ -583,13 +689,12 @@ func (s *composeService) createMobyContainer(ctx context.Context,
 	service types.ServiceConfig,
 	name string,
 	number int,
-	inherit *moby.Container,
+	inherit *containerType.Summary,
 	opts createOptions,
 	w progress.Writer,
-) (moby.Container, error) {
-	var created moby.Container
+) (containerType.Summary, error) {
+	var created containerType.Summary
 	cfgs, err := s.getCreateConfigs(ctx, project, service, number, inherit, opts)
-
 	if err != nil {
 		return created, err
 	}
@@ -622,11 +727,11 @@ func (s *composeService) createMobyContainer(ctx context.Context,
 	if err != nil {
 		return created, err
 	}
-	created = moby.Container{
+	created = containerType.Summary{
 		ID:     inspectedContainer.ID,
 		Labels: inspectedContainer.Config.Labels,
 		Names:  []string{inspectedContainer.Name},
-		NetworkSettings: &moby.SummaryNetworkSettings{
+		NetworkSettings: &containerType.NetworkSettingsSummary{
 			Networks: inspectedContainer.NetworkSettings.Networks,
 		},
 	}
@@ -654,14 +759,7 @@ func (s *composeService) createMobyContainer(ctx context.Context,
 			}
 		}
 	}
-
-	err = s.injectSecrets(ctx, project, service, created.ID)
-	if err != nil {
-		return created, err
-	}
-
-	err = s.injectConfigs(ctx, project, service, created.ID)
-	return created, err
+	return created, nil
 }
 
 // getLinks mimics V1 compose/service.py::Service::_get_links()
@@ -743,11 +841,11 @@ func (s *composeService) isServiceHealthy(ctx context.Context, containers Contai
 			return false, fmt.Errorf("container %s has no healthcheck configured", name)
 		}
 		switch container.State.Health.Status {
-		case moby.Healthy:
+		case containerType.Healthy:
 			// Continue by checking the next container.
-		case moby.Unhealthy:
+		case containerType.Unhealthy:
 			return false, fmt.Errorf("container %s is unhealthy", name)
-		case moby.Starting:
+		case containerType.Starting:
 			return false, nil
 		default:
 			return false, fmt.Errorf("container %s had unexpected health status %q", name, container.State.Health.Status)
@@ -769,7 +867,11 @@ func (s *composeService) isServiceCompleted(ctx context.Context, containers Cont
 	return false, 0, nil
 }
 
-func (s *composeService) startService(ctx context.Context, project *types.Project, service types.ServiceConfig, containers Containers, timeout time.Duration) error {
+func (s *composeService) startService(ctx context.Context,
+	project *types.Project, service types.ServiceConfig,
+	containers Containers, listener api.ContainerEventListener,
+	timeout time.Duration,
+) error {
 	if service.Deploy != nil && service.Deploy.Replicas != nil && *service.Deploy.Replicas == 0 {
 		return nil
 	}
@@ -787,16 +889,35 @@ func (s *composeService) startService(ctx context.Context, project *types.Projec
 	}
 
 	w := progress.ContextWriter(ctx)
-	for _, container := range containers.filter(isService(service.Name)) {
-		if container.State == ContainerRunning {
+	for _, ctr := range containers.filter(isService(service.Name)) {
+		if ctr.State == ContainerRunning {
 			continue
 		}
-		eventName := getContainerProgressName(container)
-		w.Event(progress.StartingEvent(eventName))
-		err := s.apiClient().ContainerStart(ctx, container.ID, containerType.StartOptions{})
+
+		err = s.injectSecrets(ctx, project, service, ctr.ID)
 		if err != nil {
 			return err
 		}
+
+		err = s.injectConfigs(ctx, project, service, ctr.ID)
+		if err != nil {
+			return err
+		}
+
+		eventName := getContainerProgressName(ctr)
+		w.Event(progress.StartingEvent(eventName))
+		err = s.apiClient().ContainerStart(ctx, ctr.ID, containerType.StartOptions{})
+		if err != nil {
+			return err
+		}
+
+		for _, hook := range service.PostStart {
+			err = s.runHook(ctx, ctr, service, hook, listener)
+			if err != nil {
+				return err
+			}
+		}
+
 		w.Event(progress.StartedEvent(eventName))
 	}
 	return nil

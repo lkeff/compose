@@ -27,7 +27,7 @@ import (
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/mocks"
 	"github.com/docker/compose/v2/pkg/watch"
-	moby "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/jonboulle/clockwork"
@@ -35,44 +35,6 @@ import (
 	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 )
-
-func TestDebounceBatching(t *testing.T) {
-	ch := make(chan fileEvent)
-	clock := clockwork.NewFakeClock()
-	ctx, stop := context.WithCancel(context.Background())
-	t.Cleanup(stop)
-
-	eventBatchCh := batchDebounceEvents(ctx, clock, quietPeriod, ch)
-	for i := 0; i < 100; i++ {
-		var action types.WatchAction = "a"
-		if i%2 == 0 {
-			action = "b"
-		}
-		ch <- fileEvent{Action: action}
-	}
-	// we sent 100 events + the debouncer
-	clock.BlockUntil(101)
-	clock.Advance(quietPeriod)
-	select {
-	case batch := <-eventBatchCh:
-		require.ElementsMatch(t, batch, []fileEvent{
-			{Action: "a"},
-			{Action: "b"},
-		})
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("timed out waiting for events")
-	}
-	clock.BlockUntil(1)
-	clock.Advance(quietPeriod)
-
-	// there should only be a single batch
-	select {
-	case batch := <-eventBatchCh:
-		t.Fatalf("unexpected events: %v", batch)
-	case <-time.After(50 * time.Millisecond):
-		// channel is empty
-	}
-}
 
 type testWatcher struct {
 	events chan watch.FileEvent
@@ -105,21 +67,19 @@ func (s stdLogger) Err(containerName, message string) {
 	fmt.Fprintf(os.Stderr, "%s: %s\n", containerName, message)
 }
 
-func (s stdLogger) Status(container, msg string) {
-	fmt.Printf("%s: %s\n", container, msg)
+func (s stdLogger) Status(containerName, msg string) {
+	fmt.Printf("%s: %s\n", containerName, msg)
 }
 
-func (s stdLogger) Register(container string) {
-
+func (s stdLogger) Register(containerName string) {
 }
 
 func TestWatch_Sync(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cli := mocks.NewMockCli(mockCtrl)
 	cli.EXPECT().Err().Return(streams.NewOut(os.Stderr)).AnyTimes()
-	cli.EXPECT().BuildKitEnabled().Return(true, nil)
 	apiClient := mocks.NewMockAPIClient(mockCtrl)
-	apiClient.EXPECT().ContainerList(gomock.Any(), gomock.Any()).Return([]moby.Container{
+	apiClient.EXPECT().ContainerList(gomock.Any(), gomock.Any()).Return([]container.Summary{
 		testContainer("test", "123", false),
 	}, nil).AnyTimes()
 	// we expect the image to be pruned
@@ -161,32 +121,38 @@ func TestWatch_Sync(t *testing.T) {
 			dockerCli: cli,
 			clock:     clock,
 		}
-		err := service.watchEvents(ctx, &proj, "test", api.WatchOptions{
+		rules, err := getWatchRules(&types.DevelopConfig{
+			Watch: []types.Trigger{
+				{
+					Path:   "/sync",
+					Action: "sync",
+					Target: "/work",
+					Ignore: []string{"ignore"},
+				},
+				{
+					Path:   "/rebuild",
+					Action: "rebuild",
+				},
+			},
+		}, types.ServiceConfig{Name: "test"})
+		assert.NilError(t, err)
+
+		err = service.watchEvents(ctx, &proj, api.WatchOptions{
 			Build: &api.BuildOptions{},
 			LogTo: stdLogger{},
 			Prune: true,
-		}, watcher, syncer, []types.Trigger{
-			{
-				Path:   "/sync",
-				Action: "sync",
-				Target: "/work",
-				Ignore: []string{"ignore"},
-			},
-			{
-				Path:   "/rebuild",
-				Action: "rebuild",
-			},
-		})
+		}, watcher, syncer, rules)
 		assert.NilError(t, err)
 	}()
 
 	watcher.Events() <- watch.NewFileEvent("/sync/changed")
 	watcher.Events() <- watch.NewFileEvent("/sync/changed/sub")
-	clock.BlockUntil(3)
-	clock.Advance(quietPeriod)
+	err := clock.BlockUntilContext(ctx, 3)
+	assert.NilError(t, err)
+	clock.Advance(watch.QuietPeriod)
 	select {
 	case actual := <-syncer.synced:
-		require.ElementsMatch(t, []sync.PathMapping{
+		require.ElementsMatch(t, []*sync.PathMapping{
 			{HostPath: "/sync/changed", ContainerPath: "/work/changed"},
 			{HostPath: "/sync/changed/sub", ContainerPath: "/work/changed/sub"},
 		}, actual)
@@ -194,24 +160,11 @@ func TestWatch_Sync(t *testing.T) {
 		t.Error("timeout")
 	}
 
-	watcher.Events() <- watch.NewFileEvent("/sync/ignore")
-	watcher.Events() <- watch.NewFileEvent("/sync/ignore/sub")
-	watcher.Events() <- watch.NewFileEvent("/sync/changed")
-	clock.BlockUntil(4)
-	clock.Advance(quietPeriod)
-	select {
-	case actual := <-syncer.synced:
-		require.ElementsMatch(t, []sync.PathMapping{
-			{HostPath: "/sync/changed", ContainerPath: "/work/changed"},
-		}, actual)
-	case <-time.After(100 * time.Millisecond):
-		t.Error("timed out waiting for events")
-	}
-
 	watcher.Events() <- watch.NewFileEvent("/rebuild")
 	watcher.Events() <- watch.NewFileEvent("/sync/changed")
-	clock.BlockUntil(4)
-	clock.Advance(quietPeriod)
+	err = clock.BlockUntilContext(ctx, 4)
+	assert.NilError(t, err)
+	clock.Advance(watch.QuietPeriod)
 	select {
 	case batch := <-syncer.synced:
 		t.Fatalf("received unexpected events: %v", batch)
@@ -222,16 +175,16 @@ func TestWatch_Sync(t *testing.T) {
 }
 
 type fakeSyncer struct {
-	synced chan []sync.PathMapping
+	synced chan []*sync.PathMapping
 }
 
 func newFakeSyncer() *fakeSyncer {
 	return &fakeSyncer{
-		synced: make(chan []sync.PathMapping),
+		synced: make(chan []*sync.PathMapping),
 	}
 }
 
-func (f *fakeSyncer) Sync(_ context.Context, _ types.ServiceConfig, paths []sync.PathMapping) error {
+func (f *fakeSyncer) Sync(ctx context.Context, service string, paths []*sync.PathMapping) error {
 	f.synced <- paths
 	return nil
 }

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,16 +38,15 @@ import (
 	dockercli "github.com/docker/cli/cli"
 	"github.com/docker/cli/cli-plugins/manager"
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/cli/pkg/kvfile"
 	"github.com/docker/compose/v2/cmd/formatter"
 	"github.com/docker/compose/v2/internal/desktop"
 	"github.com/docker/compose/v2/internal/experimental"
 	"github.com/docker/compose/v2/internal/tracing"
 	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
 	ui "github.com/docker/compose/v2/pkg/progress"
 	"github.com/docker/compose/v2/pkg/remote"
 	"github.com/docker/compose/v2/pkg/utils"
-	buildkit "github.com/moby/buildkit/util/progress/progressui"
 	"github.com/morikuni/aec"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -68,7 +68,28 @@ const (
 	ComposeEnvFiles = "COMPOSE_ENV_FILES"
 	// ComposeMenu defines if the navigation menu should be rendered. Can be also set via --menu
 	ComposeMenu = "COMPOSE_MENU"
+	// ComposeProgress defines type of progress output, if --progress isn't used
+	ComposeProgress = "COMPOSE_PROGRESS"
 )
+
+// rawEnv load a dot env file using docker/cli key=value parser, without attempt to interpolate or evaluate values
+func rawEnv(r io.Reader, filename string, vars map[string]string, lookup func(key string) (string, bool)) error {
+	lines, err := kvfile.ParseFromReader(r, lookup)
+	if err != nil {
+		return fmt.Errorf("failed to parse env_file %s: %w", filename, err)
+	}
+	for _, line := range lines {
+		key, value, _ := strings.Cut(line, "=")
+		vars[key] = value
+	}
+	return nil
+}
+
+func init() {
+	// compose evaluates env file values for interpolation
+	// `raw` format allows to load env_file with the same parser used by docker run --env-file
+	dotenv.RegisterFormat("raw", rawEnv)
+}
 
 type Backend interface {
 	api.Service
@@ -99,17 +120,9 @@ func AdaptCmd(fn CobraCommand) func(cmd *cobra.Command, args []string) error {
 		}()
 
 		err := fn(ctx, cmd, args)
-		var composeErr compose.Error
 		if api.IsErrCanceled(err) || errors.Is(ctx.Err(), context.Canceled) {
 			err = dockercli.StatusError{
 				StatusCode: 130,
-				Status:     compose.CanceledStatus,
-			}
-		}
-		if errors.As(err, &composeErr) {
-			err = dockercli.StatusError{
-				StatusCode: composeErr.GetMetricsFailureCategory().ExitCode,
-				Status:     err.Error(),
 			}
 		}
 		if ui.Mode == ui.ModeJSON {
@@ -157,7 +170,7 @@ func (o *ProjectOptions) WithServices(dockerCli command.Cli, fn ProjectServicesF
 	return Adapt(func(ctx context.Context, args []string) error {
 		options := []cli.ProjectOptionsFn{
 			cli.WithResolvedPaths(true),
-			cli.WithDiscardEnvFile,
+			cli.WithoutEnvironmentResolution,
 		}
 
 		project, metrics, err := o.ToProject(ctx, dockerCli, args, options...)
@@ -166,6 +179,11 @@ func (o *ProjectOptions) WithServices(dockerCli command.Cli, fn ProjectServicesF
 		}
 
 		ctx = context.WithValue(ctx, tracing.MetricsKey{}, metrics)
+
+		project, err = project.WithServicesEnvironmentResolved(true)
+		if err != nil {
+			return err
+		}
 
 		return fn(ctx, project, args)
 	})
@@ -211,7 +229,7 @@ func (o *ProjectOptions) addProjectFlags(f *pflag.FlagSet) {
 	f.StringVar(&o.ProjectDir, "project-directory", "", "Specify an alternate working directory\n(default: the path of the, first specified, Compose file)")
 	f.StringVar(&o.WorkDir, "workdir", "", "DEPRECATED! USE --project-directory INSTEAD.\nSpecify an alternate working directory\n(default: the path of the, first specified, Compose file)")
 	f.BoolVar(&o.Compatibility, "compatibility", false, "Run compose in backward compatibility mode")
-	f.StringVar(&o.Progress, "progress", string(buildkit.AutoMode), fmt.Sprintf(`Set type of progress output (%s)`, strings.Join(printerModes, ", ")))
+	f.StringVar(&o.Progress, "progress", os.Getenv(ComposeProgress), fmt.Sprintf(`Set type of progress output (%s)`, strings.Join(printerModes, ", ")))
 	f.BoolVar(&o.All, "all-resources", false, "Include all resources, even those not used by services")
 	_ = f.MarkHidden("workdir")
 }
@@ -285,7 +303,7 @@ func (o *ProjectOptions) ToProject(ctx context.Context, dockerCli command.Cli, s
 
 	options, err := o.toProjectOptions(po...)
 	if err != nil {
-		return nil, metrics, compose.WrapComposeError(err)
+		return nil, metrics, err
 	}
 
 	options.WithListeners(func(event string, metadata map[string]any) {
@@ -317,7 +335,7 @@ func (o *ProjectOptions) ToProject(ctx context.Context, dockerCli command.Cli, s
 
 	project, err := options.LoadProject(ctx)
 	if err != nil {
-		return nil, metrics, compose.WrapComposeError(err)
+		return nil, metrics, err
 	}
 
 	if project.Name == "" {
@@ -359,17 +377,24 @@ func (o *ProjectOptions) remoteLoaders(dockerCli command.Cli) []loader.ResourceL
 	if o.Offline {
 		return nil
 	}
-	git := remote.NewGitRemoteLoader(o.Offline)
+	git := remote.NewGitRemoteLoader(dockerCli, o.Offline)
 	oci := remote.NewOCIRemoteLoader(dockerCli, o.Offline)
 	return []loader.ResourceLoader{git, oci}
 }
 
 func (o *ProjectOptions) toProjectOptions(po ...cli.ProjectOptionsFn) (*cli.ProjectOptions, error) {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
 	return cli.NewProjectOptions(o.ConfigPaths,
 		append(po,
 			cli.WithWorkingDirectory(o.ProjectDir),
 			// First apply os.Environment, always win
 			cli.WithOsEnv,
+			// set PWD as this variable is not consistently supported on Windows
+			cli.WithEnv([]string{"PWD=" + pwd}),
 			// Load PWD/.env if present and no explicit --env-file has been set
 			cli.WithEnvFiles(o.EnvFiles...),
 			// read dot env file to populate project environment
@@ -431,7 +456,7 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 			}
 			_ = cmd.Help()
 			return dockercli.StatusError{
-				StatusCode: compose.CommandSyntaxFailure.ExitCode,
+				StatusCode: 1,
 				Status:     fmt.Sprintf("unknown docker command: %q", "compose "+args[0]),
 			}
 		},
@@ -482,8 +507,7 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 			}
 
 			switch opts.Progress {
-			case ui.ModeAuto:
-				ui.Mode = ui.ModeAuto
+			case "", ui.ModeAuto:
 				if ansi == "never" {
 					ui.Mode = ui.ModePlain
 				}
@@ -525,10 +549,7 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 			}
 
 			composeCmd := cmd
-			for {
-				if composeCmd.Name() == PluginName {
-					break
-				}
+			for composeCmd.Name() != PluginName {
 				if !composeCmd.HasParent() {
 					return fmt.Errorf("error parsing command line, expected %q", PluginName)
 				}
@@ -580,7 +601,7 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 	}
 
 	c.AddCommand(
-		upCommand(&opts, dockerCli, backend, experiments),
+		upCommand(&opts, dockerCli, backend),
 		downCommand(&opts, dockerCli, backend),
 		startCommand(&opts, dockerCli, backend),
 		restartCommand(&opts, dockerCli, backend),
@@ -594,6 +615,8 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 		removeCommand(&opts, dockerCli, backend),
 		execCommand(&opts, dockerCli, backend),
 		attachCommand(&opts, dockerCli, backend),
+		exportCommand(&opts, dockerCli, backend),
+		commitCommand(&opts, dockerCli, backend),
 		pauseCommand(&opts, dockerCli, backend),
 		unpauseCommand(&opts, dockerCli, backend),
 		topCommand(&opts, dockerCli, backend),
@@ -610,7 +633,10 @@ func RootCommand(dockerCli command.Cli, backend Backend) *cobra.Command { //noli
 		scaleCommand(&opts, dockerCli, backend),
 		statsCommand(&opts, dockerCli),
 		watchCommand(&opts, dockerCli, backend),
+		publishCommand(&opts, dockerCli, backend),
 		alphaCommand(&opts, dockerCli, backend),
+		bridgeCommand(&opts, dockerCli),
+		volumesCommand(&opts, dockerCli, backend),
 	)
 
 	c.Flags().SetInterspersed(false)

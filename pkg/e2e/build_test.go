@@ -32,9 +32,8 @@ import (
 )
 
 func TestLocalComposeBuild(t *testing.T) {
-
-	for _, env := range []string{"DOCKER_BUILDKIT=0", "DOCKER_BUILDKIT=1"} {
-		c := NewCLI(t, WithEnv(env))
+	for _, env := range []string{"DOCKER_BUILDKIT=0", "DOCKER_BUILDKIT=1", "DOCKER_BUILDKIT=1,COMPOSE-BAKE=1"} {
+		c := NewCLI(t, WithEnv(strings.Split(env, ",")...))
 
 		t.Run(env+" build named and unnamed images", func(t *testing.T) {
 			// ensure local test run does not reuse previously build image
@@ -118,15 +117,20 @@ func TestLocalComposeBuild(t *testing.T) {
 		})
 
 		t.Run(env+" rebuild when up --build", func(t *testing.T) {
-			res := c.RunDockerComposeCmd(t, "--workdir", "fixtures/build-test", "up", "-d", "--build")
+			res := c.RunDockerComposeCmd(t, "--project-directory", "fixtures/build-test", "up", "-d", "--build")
 
 			res.Assert(t, icmd.Expected{Out: "COPY static /usr/share/nginx/html"})
 			res.Assert(t, icmd.Expected{Out: "COPY static2 /usr/share/nginx/html"})
 		})
 
 		t.Run(env+" build --push ignored for unnamed images", func(t *testing.T) {
-			res := c.RunDockerComposeCmd(t, "--workdir", "fixtures/build-test", "build", "--push", "nginx")
+			res := c.RunDockerComposeCmd(t, "--project-directory", "fixtures/build-test", "build", "--push", "nginx")
 			assert.Assert(t, !strings.Contains(res.Stdout(), "failed to push"), res.Stdout())
+		})
+
+		t.Run(env+" build --quiet", func(t *testing.T) {
+			res := c.RunDockerComposeCmd(t, "--project-directory", "fixtures/build-test", "build", "--quiet")
+			res.Assert(t, icmd.Expected{Out: ""})
 		})
 
 		t.Run(env+" cleanup build project", func(t *testing.T) {
@@ -135,7 +139,6 @@ func TestLocalComposeBuild(t *testing.T) {
 			c.RunDockerOrExitError(t, "rmi", "-f", "custom-nginx")
 		})
 	}
-
 }
 
 func TestBuildSSH(t *testing.T) {
@@ -150,7 +153,6 @@ func TestBuildSSH(t *testing.T) {
 			ExitCode: 1,
 			Err:      "invalid empty ssh agent socket: make sure SSH_AUTH_SOCK is set",
 		})
-
 	})
 
 	t.Run("build succeed with ssh from Compose file", func(t *testing.T) {
@@ -168,17 +170,20 @@ func TestBuildSSH(t *testing.T) {
 		c.RunDockerCmd(t, "image", "inspect", "build-test-ssh")
 	})
 
-	t.Run("build failed with wrong ssh key id from CLI", func(t *testing.T) {
-		c.RunDockerOrExitError(t, "rmi", "build-test-ssh")
+	/*
+		FIXME disabled waiting for https://github.com/moby/buildkit/issues/5558
+		t.Run("build failed with wrong ssh key id from CLI", func(t *testing.T) {
+			c.RunDockerOrExitError(t, "rmi", "build-test-ssh")
 
-		res := c.RunDockerComposeCmdNoCheck(t, "-f", "fixtures/build-test/ssh/compose-without-ssh.yaml",
-			"--project-directory", "fixtures/build-test/ssh", "build", "--no-cache", "--ssh",
-			"wrong-ssh=./fixtures/build-test/ssh/fake_rsa")
-		res.Assert(t, icmd.Expected{
-			ExitCode: 17,
-			Err:      "unset ssh forward key fake-ssh",
+			res := c.RunDockerComposeCmdNoCheck(t, "-f", "fixtures/build-test/ssh/compose-without-ssh.yaml",
+				"--project-directory", "fixtures/build-test/ssh", "build", "--no-cache", "--ssh",
+				"wrong-ssh=./fixtures/build-test/ssh/fake_rsa")
+			res.Assert(t, icmd.Expected{
+				ExitCode: 1,
+				Err:      "unset ssh forward key fake-ssh",
+			})
 		})
-	})
+	*/
 
 	t.Run("build succeed as part of up with ssh from Compose file", func(t *testing.T) {
 		c.RunDockerOrExitError(t, "rmi", "build-test-ssh")
@@ -215,7 +220,6 @@ func TestBuildTags(t *testing.T) {
 	c := NewParallelCLI(t)
 
 	t.Run("build with tags", func(t *testing.T) {
-
 		// ensure local test run does not reuse previously build image
 		c.RunDockerOrExitError(t, "rmi", "build-test-tags")
 
@@ -233,7 +237,7 @@ func TestBuildTags(t *testing.T) {
 }
 
 func TestBuildImageDependencies(t *testing.T) {
-	doTest := func(t *testing.T, cli *CLI) {
+	doTest := func(t *testing.T, cli *CLI, args ...string) {
 		resetState := func() {
 			cli.RunDockerComposeCmd(t, "down", "--rmi=all", "-t=0")
 			res := cli.RunDockerOrExitError(t, "image", "rm", "build-dependencies-service")
@@ -251,7 +255,7 @@ func TestBuildImageDependencies(t *testing.T) {
 			Err:      "No such image: build-dependencies-service",
 		})
 
-		res = cli.RunDockerComposeCmd(t, "build")
+		res = cli.RunDockerComposeCmd(t, args...)
 		t.Log(res.Combined())
 
 		res = cli.RunDockerCmd(t,
@@ -272,17 +276,39 @@ func TestBuildImageDependencies(t *testing.T) {
 	t.Run("ClassicBuilder", func(t *testing.T) {
 		cli := NewCLI(t, WithEnv(
 			"DOCKER_BUILDKIT=0",
-			"COMPOSE_FILE=./fixtures/build-dependencies/compose.yaml",
+			"COMPOSE_FILE=./fixtures/build-dependencies/classic.yaml",
 		))
-		doTest(t, cli)
+		doTest(t, cli, "build")
+		doTest(t, cli, "build", "--with-dependencies", "service")
 	})
 
-	t.Run("BuildKit", func(t *testing.T) {
+	t.Run("BuildKit by dependency order", func(t *testing.T) {
 		cli := NewCLI(t, WithEnv(
-			"DOCKER_BUILDKIT=1",
+			"DOCKER_BUILDKIT=1", "COMPOSE_BAKE=0",
+			"COMPOSE_FILE=./fixtures/build-dependencies/classic.yaml",
+		))
+		doTest(t, cli, "build")
+		doTest(t, cli, "build", "--with-dependencies", "service")
+	})
+
+	t.Run("BuildKit by additional contexts", func(t *testing.T) {
+		cli := NewCLI(t, WithEnv(
+			"DOCKER_BUILDKIT=1", "COMPOSE_BAKE=0",
 			"COMPOSE_FILE=./fixtures/build-dependencies/compose.yaml",
 		))
-		doTest(t, cli)
+		doTest(t, cli, "build")
+		doTest(t, cli, "build", "service")
+		doTest(t, cli, "up", "--build", "service")
+	})
+
+	t.Run("Bake by additional contexts", func(t *testing.T) {
+		cli := NewCLI(t, WithEnv(
+			"DOCKER_BUILDKIT=1", "COMPOSE_BAKE=1",
+			"COMPOSE_FILE=./fixtures/build-dependencies/compose.yaml",
+		))
+		doTest(t, cli, "--verbose", "build")
+		doTest(t, cli, "--verbose", "build", "service")
+		doTest(t, cli, "--verbose", "up", "--build", "service")
 	})
 }
 
@@ -305,8 +331,8 @@ func TestBuildPlatformsWithCorrectBuildxConfig(t *testing.T) {
 		res := c.RunDockerComposeCmdNoCheck(t, "--project-directory", "fixtures/build-test/platforms",
 			"-f", "fixtures/build-test/platforms/compose-unsupported-platform.yml", "build")
 		res.Assert(t, icmd.Expected{
-			ExitCode: 17,
-			Err:      "no match for platform in",
+			ExitCode: 1,
+			Err:      "no match for platform",
 		})
 	})
 
@@ -315,7 +341,6 @@ func TestBuildPlatformsWithCorrectBuildxConfig(t *testing.T) {
 		assert.NilError(t, res.Error, res.Stderr())
 		res.Assert(t, icmd.Expected{Out: "I am building for linux/arm64"})
 		res.Assert(t, icmd.Expected{Out: "I am building for linux/amd64"})
-
 	})
 
 	t.Run("multi-arch multi service builds ok", func(t *testing.T) {
@@ -352,7 +377,6 @@ func TestBuildPlatformsWithCorrectBuildxConfig(t *testing.T) {
 		assert.NilError(t, res.Error, res.Stderr())
 		res.Assert(t, icmd.Expected{Out: "I am building for linux/386"})
 	})
-
 }
 
 func TestBuildPrivileged(t *testing.T) {
@@ -405,9 +429,8 @@ func TestBuildPlatformsStandardErrors(t *testing.T) {
 	t.Run("builder does not support multi-arch", func(t *testing.T) {
 		res := c.RunDockerComposeCmdNoCheck(t, "--project-directory", "fixtures/build-test/platforms", "build")
 		res.Assert(t, icmd.Expected{
-			ExitCode: 17,
-			Err: `Multi-platform build is not supported for the docker driver.
-Switch to a different driver, or turn on the containerd image store, and try again.`,
+			ExitCode: 1,
+			Err:      "Multi-platform build is not supported for the docker driver.",
 		})
 	})
 
@@ -415,7 +438,7 @@ Switch to a different driver, or turn on the containerd image store, and try aga
 		res := c.RunDockerComposeCmdNoCheck(t, "--project-directory", "fixtures/build-test/platforms",
 			"-f", "fixtures/build-test/platforms/compose-service-platform-not-in-build-platforms.yaml", "build")
 		res.Assert(t, icmd.Expected{
-			ExitCode: 15,
+			ExitCode: 1,
 			Err:      `service.build.platforms MUST include service.platform "linux/riscv64"`,
 		})
 	})
@@ -442,7 +465,6 @@ Switch to a different driver, or turn on the containerd image store, and try aga
 			Err:      "the classic builder doesn't support privileged mode, set DOCKER_BUILDKIT=1 to use BuildKit",
 		})
 	})
-
 }
 
 func TestBuildBuilder(t *testing.T) {
@@ -469,7 +491,6 @@ func TestBuildBuilder(t *testing.T) {
 			Err:      fmt.Sprintf(`no builder %q found`, "unknown-builder"),
 		})
 	})
-
 }
 
 func TestBuildEntitlements(t *testing.T) {
@@ -502,4 +523,76 @@ func TestBuildEntitlements(t *testing.T) {
 			t.Fatalf("CapEff %s is missing CAP_SYS_ADMIN", matches[1])
 		}
 	})
+}
+
+func TestBuildDependsOn(t *testing.T) {
+	c := NewParallelCLI(t)
+
+	t.Cleanup(func() {
+		c.RunDockerComposeCmd(t, "-f", "fixtures/build-dependencies/compose-depends_on.yaml", "down", "--rmi=local")
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-dependencies/compose-depends_on.yaml", "--progress=plain", "up", "test2")
+	out := res.Combined()
+	assert.Check(t, strings.Contains(out, "test1  Built"))
+}
+
+func TestBuildSubset(t *testing.T) {
+	c := NewParallelCLI(t)
+
+	t.Cleanup(func() {
+		c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/subset/compose.yaml", "down", "--rmi=local")
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/subset/compose.yaml", "build", "main")
+	out := res.Combined()
+	assert.Check(t, strings.Contains(out, "main  Built"))
+}
+
+func TestBuildDependentImage(t *testing.T) {
+	c := NewParallelCLI(t)
+
+	t.Cleanup(func() {
+		c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/dependencies/compose.yaml", "down", "--rmi=local")
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/dependencies/compose.yaml", "build", "firstbuild")
+	out := res.Combined()
+	assert.Check(t, strings.Contains(out, "firstbuild  Built"))
+
+	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/dependencies/compose.yaml", "build", "secondbuild")
+	out = res.Combined()
+	assert.Check(t, strings.Contains(out, "secondbuild  Built"))
+}
+
+func TestBuildSubDependencies(t *testing.T) {
+	c := NewParallelCLI(t)
+
+	t.Cleanup(func() {
+		c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/sub-dependencies/compose.yaml", "down", "--rmi=local")
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/sub-dependencies/compose.yaml", "build", "main")
+	out := res.Combined()
+	assert.Check(t, strings.Contains(out, "main  Built"))
+
+	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/sub-dependencies/compose.yaml", "up", "--build", "main")
+	out = res.Combined()
+	assert.Check(t, strings.Contains(out, "main  Built"))
+}
+
+func TestBuildLongOutputLine(t *testing.T) {
+	c := NewParallelCLI(t)
+
+	t.Cleanup(func() {
+		c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/long-output-line/compose.yaml", "down", "--rmi=local")
+	})
+
+	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/long-output-line/compose.yaml", "build", "long-line")
+	out := res.Combined()
+	assert.Check(t, strings.Contains(out, "long-line  Built"))
+
+	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/long-output-line/compose.yaml", "up", "--build", "long-line")
+	out = res.Combined()
+	assert.Check(t, strings.Contains(out, "long-line  Built"))
 }

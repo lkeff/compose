@@ -24,6 +24,7 @@ import (
 
 func TestSecretFromEnv(t *testing.T) {
 	c := NewParallelCLI(t)
+	defer c.cleanupWithDown(t, "env-secret")
 
 	t.Run("compose run", func(t *testing.T) {
 		res := icmd.RunCmd(c.NewDockerComposeCmd(t, "-f", "./fixtures/env-secret/compose.yaml", "run", "foo"),
@@ -38,5 +39,15 @@ func TestSecretFromEnv(t *testing.T) {
 				cmd.Env = append(cmd.Env, "SECRET=BAR")
 			})
 		res.Assert(t, icmd.Expected{Out: "-r--r-----    1 1005     1005"})
+	})
+}
+
+func TestSecretFromInclude(t *testing.T) {
+	c := NewParallelCLI(t)
+	defer c.cleanupWithDown(t, "env-secret-include")
+
+	t.Run("compose run", func(t *testing.T) {
+		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/env-secret/compose.yaml", "run", "included")
+		res.Assert(t, icmd.Expected{Out: "this-is-secret"})
 	})
 }

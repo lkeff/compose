@@ -18,13 +18,11 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"io"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	containerType "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
+	"github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -39,16 +37,15 @@ func (s *composeService) Logs(
 	consumer api.LogConsumer,
 	options api.LogOptions,
 ) error {
-
 	var containers Containers
 	var err error
 
 	if options.Index > 0 {
-		container, err := s.getSpecifiedContainer(ctx, projectName, oneOffExclude, true, options.Services[0], options.Index)
+		ctr, err := s.getSpecifiedContainer(ctx, projectName, oneOffExclude, true, options.Services[0], options.Index)
 		if err != nil {
 			return err
 		}
-		containers = append(containers, container)
+		containers = append(containers, ctr)
 	} else {
 		containers, err = s.getContainers(ctx, projectName, oneOffExclude, true, options.Services...)
 		if err != nil {
@@ -63,13 +60,11 @@ func (s *composeService) Logs(
 	}
 
 	eg, ctx := errgroup.WithContext(ctx)
-	for _, c := range containers {
-		c := c
+	for _, ctr := range containers {
 		eg.Go(func() error {
-			err := s.logContainers(ctx, consumer, c, options)
-			var notImplErr errdefs.ErrNotImplemented
-			if errors.As(err, &notImplErr) {
-				logrus.Warnf("Can't retrieve logs for %q: %s", getCanonicalContainerName(c), err.Error())
+			err := s.logContainers(ctx, consumer, ctr, options)
+			if errdefs.IsNotImplemented(err) {
+				logrus.Warnf("Can't retrieve logs for %q: %s", getCanonicalContainerName(ctr), err.Error())
 				return nil
 			}
 			return err
@@ -94,7 +89,7 @@ func (s *composeService) Logs(
 		}
 
 		eg.Go(func() error {
-			err := s.watchContainers(ctx, projectName, options.Services, nil, printer.HandleEvent, containers, func(c types.Container, t time.Time) error {
+			err := s.watchContainers(ctx, projectName, options.Services, nil, printer.HandleEvent, containers, func(c container.Summary, t time.Time) error {
 				printer.HandleEvent(api.ContainerEvent{
 					Type:      api.ContainerEventAttach,
 					Container: getContainerNameWithoutProject(c),
@@ -109,15 +104,14 @@ func (s *composeService) Logs(
 						Tail:       options.Tail,
 						Timestamps: options.Timestamps,
 					})
-					var notImplErr errdefs.ErrNotImplemented
-					if errors.As(err, &notImplErr) {
+					if errdefs.IsNotImplemented(err) {
 						// ignore
 						return nil
 					}
 					return err
 				})
 				return nil
-			}, func(c types.Container, t time.Time) error {
+			}, func(c container.Summary, t time.Time) error {
 				printer.HandleEvent(api.ContainerEvent{
 					Type:      api.ContainerEventAttach,
 					Container: "", // actual name will be set by start event
@@ -134,13 +128,13 @@ func (s *composeService) Logs(
 	return eg.Wait()
 }
 
-func (s *composeService) logContainers(ctx context.Context, consumer api.LogConsumer, c types.Container, options api.LogOptions) error {
+func (s *composeService) logContainers(ctx context.Context, consumer api.LogConsumer, c container.Summary, options api.LogOptions) error {
 	cnt, err := s.apiClient().ContainerInspect(ctx, c.ID)
 	if err != nil {
 		return err
 	}
 
-	r, err := s.apiClient().ContainerLogs(ctx, cnt.ID, containerType.LogsOptions{
+	r, err := s.apiClient().ContainerLogs(ctx, cnt.ID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     options.Follow,

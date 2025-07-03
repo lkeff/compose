@@ -52,6 +52,9 @@ var (
 	// DockerBuildxExecutableName is the Os dependent Buildx plugin binary name
 	DockerBuildxExecutableName = "docker-buildx"
 
+	// DockerModelExecutableName is the Os dependent Docker-Model plugin binary name
+	DockerModelExecutableName = "docker-model"
+
 	// WindowsExecutableSuffix is the Windows executable suffix
 	WindowsExecutableSuffix = ".exe"
 )
@@ -95,6 +98,7 @@ func NewCLI(t testing.TB, opts ...CLIOption) *CLI {
 	t.Helper()
 
 	configDir := t.TempDir()
+	copyLocalConfig(t, configDir)
 	initializePlugins(t, configDir)
 	initializeContextDir(t, configDir)
 
@@ -117,11 +121,21 @@ func WithEnv(env ...string) CLIOption {
 	}
 }
 
+func copyLocalConfig(t testing.TB, configDir string) {
+	t.Helper()
+
+	// copy local config.json if exists
+	localConfig := filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
+	// if no config present just continue
+	if _, err := os.Stat(localConfig); err != nil {
+		// copy the local config.json to the test config dir
+		CopyFile(t, localConfig, filepath.Join(configDir, "config.json"))
+	}
+}
+
 // initializePlugins copies the necessary plugin files to the temporary config
 // directory for the test.
 func initializePlugins(t testing.TB, configDir string) {
-	t.Helper()
-
 	t.Cleanup(func() {
 		if t.Failed() {
 			if conf, err := os.ReadFile(filepath.Join(configDir, "config.json")); err == nil {
@@ -151,6 +165,13 @@ func initializePlugins(t testing.TB, configDir string) {
 		}
 		// We don't need a functional scan plugin, but a valid plugin binary
 		CopyFile(t, composePlugin, filepath.Join(configDir, "cli-plugins", DockerScanExecutableName))
+
+		modelPlugin, err := findPluginExecutable(DockerModelExecutableName)
+		if err != nil {
+			t.Logf("WARNING: docker-model cli-plugin not found")
+		} else {
+			CopyFile(t, modelPlugin, filepath.Join(configDir, "cli-plugins", DockerModelExecutableName))
+		}
 	}
 }
 
@@ -203,13 +224,23 @@ func findPluginExecutable(pluginExecutableName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	bin, err := filepath.Abs(filepath.Join(userDir, dockerUserDir, pluginExecutableName))
-	if err != nil {
-		return "", err
+	candidates := []string{
+		filepath.Join(userDir, dockerUserDir),
+		"/usr/local/lib/docker/cli-plugins",
+		"/usr/local/libexec/docker/cli-plugins",
+		"/usr/lib/docker/cli-plugins",
+		"/usr/libexec/docker/cli-plugins",
 	}
-	if _, err := os.Stat(bin); err == nil {
-		return bin, nil
+	for _, path := range candidates {
+		bin, err := filepath.Abs(filepath.Join(path, pluginExecutableName))
+		if err != nil {
+			return "", err
+		}
+		if _, err := os.Stat(bin); err == nil {
+			return bin, nil
+		}
 	}
+
 	return "", fmt.Errorf("plugin not found %s: %w", pluginExecutableName, os.ErrNotExist)
 }
 
@@ -481,4 +512,9 @@ func HTTPGetWithRetry(
 		return string(b)
 	}
 	return ""
+}
+
+func (c *CLI) cleanupWithDown(t testing.TB, project string, args ...string) {
+	t.Helper()
+	c.RunDockerComposeCmd(t, append([]string{"-p", project, "down", "-v", "--remove-orphans"}, args...)...)
 }

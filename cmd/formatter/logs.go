@@ -61,21 +61,32 @@ func (l *logConsumer) Register(name string) {
 }
 
 func (l *logConsumer) register(name string) *presenter {
-	cf := monochrome
-	if l.color {
-		if name == api.WatchLogger {
-			cf = makeColorFunc("92")
-		} else {
-			cf = nextColor()
+	var p *presenter
+	root, _, found := strings.Cut(name, " ")
+	if found {
+		parent := l.getPresenter(root)
+		p = &presenter{
+			colors: parent.colors,
+			name:   name,
+			prefix: parent.prefix,
+		}
+	} else {
+		cf := monochrome
+		if l.color {
+			if name == api.WatchLogger {
+				cf = makeColorFunc("92")
+			} else {
+				cf = nextColor()
+			}
+		}
+		p = &presenter{
+			colors: cf,
+			name:   name,
 		}
 	}
-	p := &presenter{
-		colors: cf,
-		name:   name,
-	}
 	l.presenters.Store(name, p)
+	l.computeWidth()
 	if l.prefix {
-		l.computeWidth()
 		l.presenters.Range(func(key, value interface{}) bool {
 			p := value.(*presenter)
 			p.setPrefix(l.width)
@@ -107,10 +118,6 @@ func (l *logConsumer) write(w io.Writer, container, message string) {
 	if l.ctx.Err() != nil {
 		return
 	}
-	if KeyboardManager != nil {
-		KeyboardManager.ClearKeyboardInfo()
-	}
-
 	p := l.getPresenter(container)
 	timestamp := time.Now().Format(jsonmessage.RFC3339NanoFixed)
 	for _, line := range strings.Split(message, "\n") {
@@ -119,10 +126,6 @@ func (l *logConsumer) write(w io.Writer, container, message string) {
 		} else {
 			_, _ = fmt.Fprintf(w, "%s%s\n", p.prefix, line)
 		}
-	}
-
-	if KeyboardManager != nil {
-		KeyboardManager.PrintKeyboardInfo()
 	}
 }
 
@@ -156,4 +159,32 @@ func (p *presenter) setPrefix(width int) {
 		return
 	}
 	p.prefix = p.colors(fmt.Sprintf("%-"+strconv.Itoa(width)+"s | ", p.name))
+}
+
+type logDecorator struct {
+	decorated api.LogConsumer
+	Before    func()
+	After     func()
+}
+
+func (l logDecorator) Log(containerName, message string) {
+	l.Before()
+	l.decorated.Log(containerName, message)
+	l.After()
+}
+
+func (l logDecorator) Err(containerName, message string) {
+	l.Before()
+	l.decorated.Err(containerName, message)
+	l.After()
+}
+
+func (l logDecorator) Status(container, msg string) {
+	l.Before()
+	l.decorated.Status(container, msg)
+	l.After()
+}
+
+func (l logDecorator) Register(container string) {
+	l.decorated.Register(container)
 }

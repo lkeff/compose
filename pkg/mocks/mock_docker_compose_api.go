@@ -5,7 +5,6 @@
 //
 //	mockgen -destination pkg/mocks/mock_docker_compose_api.go -package mocks -source=./pkg/api/api.go Service
 //
-
 // Package mocks is a generated GoMock package.
 package mocks
 
@@ -67,6 +66,20 @@ func (m *MockService) Build(ctx context.Context, project *types.Project, options
 func (mr *MockServiceMockRecorder) Build(ctx, project, options any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Build", reflect.TypeOf((*MockService)(nil).Build), ctx, project, options)
+}
+
+// Commit mocks base method.
+func (m *MockService) Commit(ctx context.Context, projectName string, options api.CommitOptions) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Commit", ctx, projectName, options)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Commit indicates an expected call of Commit.
+func (mr *MockServiceMockRecorder) Commit(ctx, projectName, options any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Commit", reflect.TypeOf((*MockService)(nil).Commit), ctx, projectName, options)
 }
 
 // Copy mocks base method.
@@ -155,11 +168,40 @@ func (mr *MockServiceMockRecorder) Exec(ctx, projectName, options any) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Exec", reflect.TypeOf((*MockService)(nil).Exec), ctx, projectName, options)
 }
 
+// Export mocks base method.
+func (m *MockService) Export(ctx context.Context, projectName string, options api.ExportOptions) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Export", ctx, projectName, options)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Export indicates an expected call of Export.
+func (mr *MockServiceMockRecorder) Export(ctx, projectName, options any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Export", reflect.TypeOf((*MockService)(nil).Export), ctx, projectName, options)
+}
+
+// Generate mocks base method.
+func (m *MockService) Generate(ctx context.Context, options api.GenerateOptions) (*types.Project, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Generate", ctx, options)
+	ret0, _ := ret[0].(*types.Project)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Generate indicates an expected call of Generate.
+func (mr *MockServiceMockRecorder) Generate(ctx, options any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Generate", reflect.TypeOf((*MockService)(nil).Generate), ctx, options)
+}
+
 // Images mocks base method.
-func (m *MockService) Images(ctx context.Context, projectName string, options api.ImagesOptions) ([]api.ImageSummary, error) {
+func (m *MockService) Images(ctx context.Context, projectName string, options api.ImagesOptions) (map[string]api.ImageSummary, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Images", ctx, projectName, options)
-	ret0, _ := ret[0].([]api.ImageSummary)
+	ret0, _ := ret[0].(map[string]api.ImageSummary)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -455,6 +497,21 @@ func (mr *MockServiceMockRecorder) Viz(ctx, project, options any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Viz", reflect.TypeOf((*MockService)(nil).Viz), ctx, project, options)
 }
 
+// Volumes mocks base method.
+func (m *MockService) Volumes(ctx context.Context, project *types.Project, options api.VolumesOptions) ([]api.VolumesSummary, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Volumes", ctx, project, options)
+	ret0, _ := ret[0].([]api.VolumesSummary)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Volumes indicates an expected call of Volumes.
+func (mr *MockServiceMockRecorder) Volumes(ctx, project, options any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Volumes", reflect.TypeOf((*MockService)(nil).Volumes), ctx, project, options)
+}
+
 // Wait mocks base method.
 func (m *MockService) Wait(ctx context.Context, projectName string, options api.WaitOptions) (int64, error) {
 	m.ctrl.T.Helper()
@@ -471,17 +528,17 @@ func (mr *MockServiceMockRecorder) Wait(ctx, projectName, options any) *gomock.C
 }
 
 // Watch mocks base method.
-func (m *MockService) Watch(ctx context.Context, project *types.Project, services []string, options api.WatchOptions) error {
+func (m *MockService) Watch(ctx context.Context, project *types.Project, options api.WatchOptions) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Watch", ctx, project, services, options)
+	ret := m.ctrl.Call(m, "Watch", ctx, project, options)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Watch indicates an expected call of Watch.
-func (mr *MockServiceMockRecorder) Watch(ctx, project, services, options any) *gomock.Call {
+func (mr *MockServiceMockRecorder) Watch(ctx, project, options any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Watch", reflect.TypeOf((*MockService)(nil).Watch), ctx, project, services, options)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Watch", reflect.TypeOf((*MockService)(nil).Watch), ctx, project, options)
 }
 
 // MockLogConsumer is a mock of LogConsumer interface.

@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"testing"
 
+	commands "github.com/docker/compose/v2/cmd/compose"
+	"github.com/spf13/cobra"
 	flag "github.com/spf13/pflag"
 )
 
@@ -60,5 +62,51 @@ func TestGetFlags(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestCommandName(t *testing.T) {
+	tests := []struct {
+		name     string
+		setupCmd func() *cobra.Command
+		want     []string
+	}{
+		{
+			name: "docker compose alpha watch -> [watch, alpha]",
+			setupCmd: func() *cobra.Command {
+				dockerCmd := &cobra.Command{Use: "docker"}
+				composeCmd := &cobra.Command{Use: commands.PluginName}
+				alphaCmd := &cobra.Command{Use: "alpha"}
+				watchCmd := &cobra.Command{Use: "watch"}
+
+				dockerCmd.AddCommand(composeCmd)
+				composeCmd.AddCommand(alphaCmd)
+				alphaCmd.AddCommand(watchCmd)
+
+				return watchCmd
+			},
+			want: []string{"watch", "alpha"},
+		},
+		{
+			name: "docker-compose up -> [up]",
+			setupCmd: func() *cobra.Command {
+				dockerComposeCmd := &cobra.Command{Use: commands.PluginName}
+				upCmd := &cobra.Command{Use: "up"}
+
+				dockerComposeCmd.AddCommand(upCmd)
+
+				return upCmd
+			},
+			want: []string{"up"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := tt.setupCmd()
+			got := commandName(cmd)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("commandName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
